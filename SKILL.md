@@ -1,59 +1,61 @@
-# alibye — SKILL.md
+# SKILL.md — alibye
 
 ## What
-Human time tracking CLI for AI-managed workflows. Track hours, manage projects/clients, generate timesheets, export for billing.
+Human time tracking CLI for AI-managed workflows. Start/stop timers, log manual entries, manage projects/clients, generate reports and timesheets.
 
 ## When to Use
-- Human starts/stops working on a task
-- Need to log manual time entries
-- Generate weekly timesheets or reports
-- Export time data for invoicing (pairs with prophit)
-- Track billable vs non-billable hours
-- Manage projects, clients, and rates
+- Human needs to track billable hours
+- AI agent managing human's time/schedule
+- Generating timesheets for invoicing (pairs with prophit)
+- Project/client time allocation reports
 
 ## Commands
 
+### Timer Flow
 ```bash
-# Timer
-alibye start "Task description" -p "Project" -c "Client" -t "tag1,tag2"
+alibye start "Task description" --project "Name" --client "Name" --tags "tag1,tag2"
 alibye stop
-alibye status
-alibye continue
-alibye discard
-
-# Manual entry
-alibye log --start 09:00 --end 11:30 --desc "Meeting" -p "Project"
-alibye log --start 12:00 --end 12:30 --break  # Break time
-
-# Reports
-alibye list --today
-alibye list --week --project "Project Name"
-alibye report --weekly
-alibye report --group client --from 2026-03-01 --to 2026-03-31
-alibye report --format csv -o timesheet.csv
-
-# Management
-alibye project add "Name" --client "Client" --rate 150
-alibye client add "Name" --email "email@example.com" --rate 100
-alibye tag list
-
-# Backup
-alibye backup create --reason "before migration"
-alibye backup list
+alibye status          # Dashboard
+alibye continue        # Restart last
+alibye discard         # Drop without saving
 ```
 
+### Manual Entry
+```bash
+alibye log --start 09:00 --end 12:30 --desc "Meeting" --project "Name"
+alibye list --today
+alibye list --week --project "Name"
+```
+
+### Reports
+```bash
+alibye report --today --group project
+alibye report --weekly
+alibye report --format csv -o timesheet.csv
+alibye report --json
+```
+
+### Management
+```bash
+alibye client add "Name" --rate 150
+alibye project add "Name" --client "Name" --rate 100
+alibye tag list
+alibye backup create
+```
+
+## Key Flags
+- `--json` — All commands support JSON output
+- `-d, --dir <path>` — Data directory (default: `.alibye`)
+- `ALIBYE_DIR` — Environment variable override
+
 ## Rate Cascade
-Project rate > Client rate > Default rate. Set `--rate` on project or client.
+Project rate > Client rate > Default rate > $0
 
-## Time Rounding
-Configure rounding mode (none/up/down/nearest) and interval (1/5/6/10/15/30 min).
-
-## Integration
-- **clawck**: AI agent time (automatic) — alibye is the human complement
-- **prophit**: Feed alibye timesheets into prophit for invoice generation
-- **JSON output**: All commands support `--json` for pipeline use
+## Integration Pattern
+1. Human mentions work → agent runs `alibye start`
+2. Human finishes → agent runs `alibye stop`
+3. End of week → agent runs `alibye report --weekly --json`
+4. Invoice time → export CSV for prophit
 
 ## Data
-- SQLite database at `.alibye/alibye.db` (or `ALIBYE_DIR` env)
-- Auto-backup with VACUUM INTO before migrations
-- `-d/--dir` flag overrides data directory
+SQLite database at `<data_dir>/alibye.db`. Automatic WAL-safe backups.
