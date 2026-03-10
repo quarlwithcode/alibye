@@ -51,16 +51,24 @@ export class Alibye {
   project(idOrName: string) { return this._db.getProject(idOrName); }
   projects(includeArchived = false) { return this._db.listProjects(includeArchived); }
   archiveProject(idOrName: string) { return this._db.archiveProject(idOrName); }
+  updateProject(id: string, updates: Parameters<AlibyeDB['updateProject']>[1]) { return this._db.updateProject(id, updates); }
 
   // Clients
   createClient(input: Parameters<AlibyeDB['createClient']>[0]) { return this._db.createClient(input); }
   client(idOrName: string) { return this._db.getClient(idOrName); }
   clients(includeArchived = false) { return this._db.listClients(includeArchived); }
   archiveClient(idOrName: string) { return this._db.archiveClient(idOrName); }
+  updateClient(id: string, updates: Parameters<AlibyeDB['updateClient']>[1]) { return this._db.updateClient(id, updates); }
 
   // Tags
   tags() { return this._db.listTags(); }
   deleteTag(name: string) { return this._db.deleteTag(name); }
+
+  // Budget & Burn
+  projectBudget(idOrName: string) { return this._db.getBudgetStatus('project', idOrName); }
+  clientBudget(idOrName: string) { return this._db.getBudgetStatus('client', idOrName); }
+  taskBudget(idOrName: string) { return this._db.getBudgetStatus('task', idOrName); }
+  burnReport(opts: Parameters<AlibyeDB['getBurnReport']>[0]) { return this._db.getBurnReport(opts); }
 
   // Reports
   summary(from: string, to: string, groupBy?: Parameters<AlibyeDB['summaryReport']>[2]) { return this._db.summaryReport(from, to, groupBy); }

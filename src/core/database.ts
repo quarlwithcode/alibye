@@ -22,6 +22,8 @@ import {
 } from './errors.js';
 import { roundDuration, calcAmount } from './rounding.js';
 import { BackupManager } from './backup.js';
+import { calcBudgetStatus } from './budget.js';
+import { calcQuotaStatus } from './quota.js';
 
 export class AlibyeDB {
   private db: Database.Database;
@@ -417,6 +419,24 @@ export class AlibyeDB {
     this.db.prepare('UPDATE projects SET archived = 1 WHERE id = ?').run(p.id);
   }
 
+  updateProject(id: string, updates: Partial<Pick<Project, 'name' | 'client_id' | 'color' | 'billable' | 'rate' | 'budget_hours' | 'budget_amount'>>): Project {
+    const p = this.getProject(id);
+    if (!p) throw new ProjectNotFoundError(id);
+    const fields: string[] = [];
+    const values: any[] = [];
+    for (const [key, val] of Object.entries(updates)) {
+      if (val !== undefined) {
+        fields.push(`${key} = ?`);
+        values.push(key === 'billable' ? (val ? 1 : 0) : val);
+      }
+    }
+    if (fields.length > 0) {
+      values.push(p.id);
+      this.db.prepare(`UPDATE projects SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+    }
+    return this.getProject(p.id)!;
+  }
+
   // ─── Clients ──────────────────────────────────────────────
 
   createClient(input: { name: string; email?: string; rate?: number }): Client {
@@ -444,6 +464,21 @@ export class AlibyeDB {
     const c = this.getClient(idOrName);
     if (!c) throw new ClientNotFoundError(idOrName);
     this.db.prepare('UPDATE clients SET archived = 1 WHERE id = ?').run(c.id);
+  }
+
+  updateClient(id: string, updates: Partial<Pick<Client, 'name' | 'email' | 'rate' | 'budget_hours' | 'budget_amount'>>): Client {
+    const c = this.getClient(id);
+    if (!c) throw new ClientNotFoundError(id);
+    const fields: string[] = [];
+    const values: any[] = [];
+    for (const [key, val] of Object.entries(updates)) {
+      if (val !== undefined) { fields.push(`${key} = ?`); values.push(val); }
+    }
+    if (fields.length > 0) {
+      values.push(c.id);
+      this.db.prepare(`UPDATE clients SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+    }
+    return this.getClient(c.id)!;
   }
 
   // ─── Tasks ──────────────────────────────────────────────────
@@ -584,6 +619,71 @@ export class AlibyeDB {
     this.db.prepare('DELETE FROM tags WHERE name = ?').run(name);
   }
 
+  // ─── Budget & Quota ─────────────────────────────────────────
+
+  getBudgetStatus(entityType: 'project' | 'client' | 'task', idOrName: string): BudgetStatus {
+    let entity: { id: string; name: string; budget_hours?: number | null; budget_amount?: number | null } | null = null;
+    let entries: TimeEntry[] = [];
+
+    if (entityType === 'project') {
+      const p = this.getProject(idOrName);
+      if (!p) throw new ProjectNotFoundError(idOrName);
+      entity = p;
+      entries = this.queryEntries({ project_id: p.id });
+    } else if (entityType === 'client') {
+      const c = this.getClient(idOrName);
+      if (!c) throw new ClientNotFoundError(idOrName);
+      entity = c;
+      entries = this.queryEntries({ client_id: c.id });
+    } else {
+      const t = this.getTask(idOrName);
+      if (!t) throw new TaskNotFoundError(idOrName);
+      entity = t;
+      entries = this.queryEntries({ task_id: t.id });
+    }
+
+    return calcBudgetStatus(entity, entityType, entries);
+  }
+
+  getActiveBudgetWarnings(): BudgetStatus[] {
+    const warnings: BudgetStatus[] = [];
+    const projects = this.listProjects().filter(p => p.budget_hours || p.budget_amount);
+    for (const p of projects) {
+      const status = this.getBudgetStatus('project', p.id);
+      if (status.status !== 'green') warnings.push(status);
+    }
+    const clients = this.listClients().filter(c => c.budget_hours || c.budget_amount);
+    for (const c of clients) {
+      const status = this.getBudgetStatus('client', c.id);
+      if (status.status !== 'green') warnings.push(status);
+    }
+    const tasks = this.listTasks().filter(t => t.budget_hours || t.budget_amount);
+    for (const t of tasks) {
+      const status = this.getBudgetStatus('task', t.id);
+      if (status.status !== 'green') warnings.push(status);
+    }
+    return warnings;
+  }
+
+  getBurnReport(opts: { project_id?: string; client_id?: string; task_id?: string }): { budget: BudgetStatus; entries: TimeEntry[] } {
+    if (opts.task_id) {
+      const budget = this.getBudgetStatus('task', opts.task_id);
+      const entries = this.queryEntries({ task_id: opts.task_id });
+      return { budget, entries };
+    }
+    if (opts.project_id) {
+      const budget = this.getBudgetStatus('project', opts.project_id);
+      const entries = this.queryEntries({ project_id: opts.project_id });
+      return { budget, entries };
+    }
+    if (opts.client_id) {
+      const budget = this.getBudgetStatus('client', opts.client_id);
+      const entries = this.queryEntries({ client_id: opts.client_id });
+      return { budget, entries };
+    }
+    throw new Error('Burn report requires --project, --client, or --task');
+  }
+
   // ─── Reports ──────────────────────────────────────────────
 
   summaryReport(from: string, to: string, groupBy: 'project' | 'client' | 'day' | 'tag' = 'project'): SummaryRow[] {
@@ -668,8 +768,8 @@ export class AlibyeDB {
       week_minutes: weekEntries.reduce((s, e) => s + e.rounded_minutes, 0),
       week_billable: weekEntries.filter(e => e.billable).reduce((s, e) => s + e.amount, 0),
       break_minutes_today: todayBreaks.reduce((s, e) => s + e.rounded_minutes, 0),
-      quota: null,
-      budget_warnings: [],
+      quota: calcQuotaStatus(this.config, todayWork.reduce((s, e) => s + e.rounded_minutes, 0), weekEntries.reduce((s, e) => s + e.rounded_minutes, 0), now.getDay()),
+      budget_warnings: this.getActiveBudgetWarnings(),
     };
   }
 
