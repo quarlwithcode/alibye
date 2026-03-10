@@ -5,8 +5,8 @@
 
 import { z } from 'zod';
 
-export const APP_VERSION = '0.1.0';
-export const SCHEMA_VERSION = 1;
+export const APP_VERSION = '0.1.1';
+export const SCHEMA_VERSION = 2;
 
 // ─── Rounding ─────────────────────────────────────────────
 
@@ -26,12 +26,15 @@ export const TimeEntrySchema = z.object({
   description: z.string().default(''),
   project_id: z.string().uuid().nullable(),
   client_id: z.string().uuid().nullable(),
+  task_id: z.string().uuid().nullable(),
+  work_type_id: z.string().uuid().nullable(),
   start: z.string(),              // ISO datetime
   end: z.string().nullable(),     // ISO datetime
   duration_ms: z.number().int().min(0),
   rounded_minutes: z.number().min(0),
   billable: z.boolean().default(true),
-  rate: z.number().min(0).nullable(),      // $/hr for this entry
+  rate: z.number().min(0).nullable(),      // $/hr — resolved via cascade
+  entry_rate_override: z.number().min(0).nullable(),  // explicit --rate value
   amount: z.number().min(0).default(0),    // rounded_minutes/60 * rate
   source: z.enum(ENTRY_SOURCES).default('manual'),
   is_break: z.boolean().default(false),
@@ -48,6 +51,8 @@ export const ProjectSchema = z.object({
   color: z.string().default('#3b82f6'),
   billable: z.boolean().default(true),
   rate: z.number().min(0).nullable(),
+  budget_hours: z.number().min(0).nullable(),
+  budget_amount: z.number().min(0).nullable(),
   archived: z.boolean().default(false),
   created_at: z.string(),
 });
@@ -58,10 +63,34 @@ export const ClientSchema = z.object({
   name: z.string().min(1),
   email: z.string().optional(),
   rate: z.number().min(0).nullable(),
+  budget_hours: z.number().min(0).nullable(),
+  budget_amount: z.number().min(0).nullable(),
   archived: z.boolean().default(false),
   created_at: z.string(),
 });
 export type Client = z.infer<typeof ClientSchema>;
+
+export const TaskSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string().min(1),
+  project_id: z.string().uuid().nullable(),
+  client_id: z.string().uuid().nullable(),
+  rate: z.number().min(0).nullable(),
+  budget_hours: z.number().min(0).nullable(),
+  budget_amount: z.number().min(0).nullable(),
+  billable: z.boolean().default(true),
+  archived: z.boolean().default(false),
+  created_at: z.string(),
+});
+export type Task = z.infer<typeof TaskSchema>;
+
+export const WorkTypeSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string().min(1),
+  rate: z.number().min(0).nullable(),
+  created_at: z.string(),
+});
+export type WorkType = z.infer<typeof WorkTypeSchema>;
 
 export const TagSchema = z.object({
   id: z.string().uuid(),
@@ -77,6 +106,8 @@ export const ActiveTimerSchema = z.object({
   description: z.string().default(''),
   project_id: z.string().uuid().nullable(),
   client_id: z.string().uuid().nullable(),
+  task_id: z.string().uuid().nullable(),
+  work_type_id: z.string().uuid().nullable(),
   start: z.string(),
   billable: z.boolean().default(true),
   tags: z.array(z.string()).default([]),
@@ -99,6 +130,8 @@ export interface AlibyeConfig {
   pomodoro_break_minutes: number;
   pomodoro_long_break_minutes: number;
   pomodoro_sessions_before_long: number;
+  weekly_quota_hours: number;
+  daily_quota_hours: number;
 }
 
 export const DEFAULT_CONFIG: AlibyeConfig = {
@@ -111,6 +144,8 @@ export const DEFAULT_CONFIG: AlibyeConfig = {
   pomodoro_break_minutes: 5,
   pomodoro_long_break_minutes: 15,
   pomodoro_sessions_before_long: 4,
+  weekly_quota_hours: 0,
+  daily_quota_hours: 0,
 };
 
 // ─── Report Types ─────────────────────────────────────────
@@ -142,6 +177,34 @@ export interface WeeklyTimesheet {
   total_entries: number;
 }
 
+export interface BudgetStatus {
+  entity_type: 'project' | 'client' | 'task';
+  entity_id: string;
+  entity_name: string;
+  budget_hours: number | null;
+  budget_amount: number | null;
+  used_hours: number;
+  used_amount: number;
+  remaining_hours: number | null;
+  remaining_amount: number | null;
+  percent_hours: number | null;
+  percent_amount: number | null;
+  status: 'green' | 'yellow' | 'red' | 'over';
+}
+
+export interface QuotaStatus {
+  daily_target: number;
+  daily_tracked: number;
+  daily_remaining: number;
+  daily_percent: number;
+  weekly_target: number;
+  weekly_tracked: number;
+  weekly_remaining: number;
+  weekly_percent: number;
+  projected_week_total: number;
+  on_pace: boolean;
+}
+
 export interface DashboardData {
   active_timer: ActiveTimer | null;
   elapsed_ms: number;
@@ -151,6 +214,8 @@ export interface DashboardData {
   week_minutes: number;
   week_billable: number;
   break_minutes_today: number;
+  quota: QuotaStatus | null;
+  budget_warnings: BudgetStatus[];
 }
 
 export interface BackupInfo {

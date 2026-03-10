@@ -47,3 +47,17 @@ export class InvalidDateRangeError extends AlibyeError {
     this.name = 'InvalidDateRangeError';
   }
 }
+
+export class TaskNotFoundError extends AlibyeError {
+  constructor(identifier: string) {
+    super(`Task not found: ${identifier}`);
+    this.name = 'TaskNotFoundError';
+  }
+}
+
+export class WorkTypeNotFoundError extends AlibyeError {
+  constructor(identifier: string) {
+    super(`Work type not found: ${identifier}`);
+    this.name = 'WorkTypeNotFoundError';
+  }
+}

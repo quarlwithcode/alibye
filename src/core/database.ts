@@ -10,13 +10,15 @@ import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import {
-  TimeEntry, Project, Client, Tag, ActiveTimer,
+  TimeEntry, Project, Client, Tag, Task, WorkType, ActiveTimer,
   AlibyeConfig, SCHEMA_VERSION,
   SummaryRow, WeeklyDay, WeeklyTimesheet, DashboardData,
+  BudgetStatus, QuotaStatus,
 } from './types.js';
 import {
   TimerAlreadyRunningError, NoActiveTimerError,
   ProjectNotFoundError, ClientNotFoundError, EntryNotFoundError,
+  TaskNotFoundError, WorkTypeNotFoundError,
 } from './errors.js';
 import { roundDuration, calcAmount } from './rounding.js';
 import { BackupManager } from './backup.js';
@@ -47,6 +49,7 @@ export class AlibyeDB {
       this.backup.backup(`pre-migration v${version} → v${SCHEMA_VERSION}`);
     }
     if (version < 1) this.migrateV1();
+    if (version < 2) this.migrateV2();
     this.setSchemaVersion(SCHEMA_VERSION);
   }
 
@@ -123,6 +126,50 @@ export class AlibyeDB {
     `);
   }
 
+  private migrateV2(): void {
+    // New tables
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS tasks (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+        project_id TEXT, client_id TEXT,
+        rate REAL, budget_hours REAL, budget_amount REAL,
+        billable INTEGER NOT NULL DEFAULT 1,
+        archived INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (project_id) REFERENCES projects(id),
+        FOREIGN KEY (client_id) REFERENCES clients(id)
+      );
+
+      CREATE TABLE IF NOT EXISTS work_types (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+        rate REAL, created_at TEXT NOT NULL
+      );
+    `);
+
+    // ALTER TABLE — all nullable, SQLite-safe
+    const addCol = (table: string, col: string, type: string) => {
+      try { this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`); } catch { /* already exists */ }
+    };
+
+    addCol('time_entries', 'task_id', 'TEXT');
+    addCol('time_entries', 'work_type_id', 'TEXT');
+    addCol('time_entries', 'entry_rate_override', 'REAL');
+    addCol('active_timer', 'task_id', 'TEXT');
+    addCol('active_timer', 'work_type_id', 'TEXT');
+    addCol('projects', 'budget_hours', 'REAL');
+    addCol('projects', 'budget_amount', 'REAL');
+    addCol('clients', 'budget_hours', 'REAL');
+    addCol('clients', 'budget_amount', 'REAL');
+
+    // Indexes
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_entries_task ON time_entries(task_id);
+      CREATE INDEX IF NOT EXISTS idx_entries_work_type ON time_entries(work_type_id);
+      CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+      CREATE INDEX IF NOT EXISTS idx_tasks_client ON tasks(client_id);
+    `);
+  }
+
   // ─── Timer ────────────────────────────────────────────────
 
   startTimer(input: { description?: string; project_id?: string; client_id?: string; billable?: boolean; tags?: string[]; pomodoro?: boolean }): ActiveTimer {
@@ -196,7 +243,7 @@ export class AlibyeDB {
   getActiveTimer(): ActiveTimer | null {
     const row = this.db.prepare('SELECT * FROM active_timer LIMIT 1').get() as any;
     if (!row) return null;
-    return { id: row.id, description: row.description, project_id: row.project_id, client_id: row.client_id, start: row.start, billable: !!row.billable, tags: JSON.parse(row.tags || '[]'), pomodoro: !!row.pomodoro, pomodoro_work_ms: row.pomodoro_work_ms, pomodoro_break_ms: row.pomodoro_break_ms, pomodoro_session: row.pomodoro_session };
+    return { id: row.id, description: row.description, project_id: row.project_id, client_id: row.client_id, task_id: row.task_id || null, work_type_id: row.work_type_id || null, start: row.start, billable: !!row.billable, tags: JSON.parse(row.tags || '[]'), pomodoro: !!row.pomodoro, pomodoro_work_ms: row.pomodoro_work_ms, pomodoro_break_ms: row.pomodoro_break_ms, pomodoro_session: row.pomodoro_session };
   }
 
   discardTimer(): void {
@@ -302,7 +349,7 @@ export class AlibyeDB {
   }
 
   private rowToEntry(row: any): TimeEntry {
-    return { id: row.id, description: row.description, project_id: row.project_id, client_id: row.client_id, start: row.start, end: row.end_, duration_ms: row.duration_ms, rounded_minutes: row.rounded_minutes, billable: !!row.billable, rate: row.rate, amount: row.amount, source: row.source, is_break: !!row.is_break, is_idle: !!row.is_idle, created_at: row.created_at, updated_at: row.updated_at };
+    return { id: row.id, description: row.description, project_id: row.project_id, client_id: row.client_id, task_id: row.task_id || null, work_type_id: row.work_type_id || null, start: row.start, end: row.end_, duration_ms: row.duration_ms, rounded_minutes: row.rounded_minutes, billable: !!row.billable, rate: row.rate, entry_rate_override: row.entry_rate_override ?? null, amount: row.amount, source: row.source, is_break: !!row.is_break, is_idle: !!row.is_idle, created_at: row.created_at, updated_at: row.updated_at };
   }
 
   // ─── Projects ─────────────────────────────────────────────
@@ -318,12 +365,16 @@ export class AlibyeDB {
 
   getProject(idOrName: string): Project | null {
     const row = this.db.prepare('SELECT * FROM projects WHERE id = ? OR name = ?').get(idOrName, idOrName) as any;
-    return row ? { id: row.id, name: row.name, client_id: row.client_id, color: row.color, billable: !!row.billable, rate: row.rate, archived: !!row.archived, created_at: row.created_at } : null;
+    return row ? this.rowToProject(row) : null;
+  }
+
+  private rowToProject(row: any): Project {
+    return { id: row.id, name: row.name, client_id: row.client_id, color: row.color, billable: !!row.billable, rate: row.rate, budget_hours: row.budget_hours ?? null, budget_amount: row.budget_amount ?? null, archived: !!row.archived, created_at: row.created_at };
   }
 
   listProjects(includeArchived = false): Project[] {
     const sql = includeArchived ? 'SELECT * FROM projects ORDER BY name' : 'SELECT * FROM projects WHERE archived = 0 ORDER BY name';
-    return (this.db.prepare(sql).all() as any[]).map(r => ({ id: r.id, name: r.name, client_id: r.client_id, color: r.color, billable: !!r.billable, rate: r.rate, archived: !!r.archived, created_at: r.created_at }));
+    return (this.db.prepare(sql).all() as any[]).map(r => this.rowToProject(r));
   }
 
   archiveProject(idOrName: string): void {
@@ -343,12 +394,16 @@ export class AlibyeDB {
 
   getClient(idOrName: string): Client | null {
     const row = this.db.prepare('SELECT * FROM clients WHERE id = ? OR name = ?').get(idOrName, idOrName) as any;
-    return row ? { id: row.id, name: row.name, email: row.email, rate: row.rate, archived: !!row.archived, created_at: row.created_at } : null;
+    return row ? this.rowToClient(row) : null;
+  }
+
+  private rowToClient(row: any): Client {
+    return { id: row.id, name: row.name, email: row.email, rate: row.rate, budget_hours: row.budget_hours ?? null, budget_amount: row.budget_amount ?? null, archived: !!row.archived, created_at: row.created_at };
   }
 
   listClients(includeArchived = false): Client[] {
     const sql = includeArchived ? 'SELECT * FROM clients ORDER BY name' : 'SELECT * FROM clients WHERE archived = 0 ORDER BY name';
-    return (this.db.prepare(sql).all() as any[]).map(r => ({ id: r.id, name: r.name, email: r.email, rate: r.rate, archived: !!r.archived, created_at: r.created_at }));
+    return (this.db.prepare(sql).all() as any[]).map(r => this.rowToClient(r));
   }
 
   archiveClient(idOrName: string): void {
@@ -460,6 +515,8 @@ export class AlibyeDB {
       week_minutes: weekEntries.reduce((s, e) => s + e.rounded_minutes, 0),
       week_billable: weekEntries.filter(e => e.billable).reduce((s, e) => s + e.amount, 0),
       break_minutes_today: todayBreaks.reduce((s, e) => s + e.rounded_minutes, 0),
+      quota: null,
+      budget_warnings: [],
     };
   }
 
