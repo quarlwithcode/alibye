@@ -172,14 +172,23 @@ export class AlibyeDB {
 
   // ─── Timer ────────────────────────────────────────────────
 
-  startTimer(input: { description?: string; project_id?: string; client_id?: string; billable?: boolean; tags?: string[]; pomodoro?: boolean }): ActiveTimer {
+  startTimer(input: { description?: string; project_id?: string; client_id?: string; task_id?: string; work_type_id?: string; billable?: boolean; tags?: string[]; pomodoro?: boolean }): ActiveTimer {
     const existing = this.getActiveTimer();
     if (existing) throw new TimerAlreadyRunningError(existing.description || '(no description)');
 
-    // Resolve client from project if not specified
+    // Auto-resolve project/client from task
+    let projectId = input.project_id || null;
     let clientId = input.client_id || null;
-    if (!clientId && input.project_id) {
-      const proj = this.getProject(input.project_id);
+    if (input.task_id) {
+      const task = this.getTask(input.task_id);
+      if (task) {
+        if (!projectId && task.project_id) projectId = task.project_id;
+        if (!clientId && task.client_id) clientId = task.client_id;
+      }
+    }
+    // Resolve client from project if still not set
+    if (!clientId && projectId) {
+      const proj = this.getProject(projectId);
       if (proj) clientId = proj.client_id;
     }
 
@@ -189,8 +198,8 @@ export class AlibyeDB {
     const pomBreak = this.config.pomodoro_break_minutes * 60 * 1000;
 
     this.db.prepare(
-      `INSERT INTO active_timer (id, description, project_id, client_id, start, billable, tags, pomodoro, pomodoro_work_ms, pomodoro_break_ms, pomodoro_session) VALUES (?,?,?,?,?,?,?,?,?,?,?)`
-    ).run(id, input.description || '', input.project_id || null, clientId, now, input.billable !== false ? 1 : 0, JSON.stringify(input.tags || []), input.pomodoro ? 1 : 0, pomWork, pomBreak, 1);
+      `INSERT INTO active_timer (id, description, project_id, client_id, task_id, work_type_id, start, billable, tags, pomodoro, pomodoro_work_ms, pomodoro_break_ms, pomodoro_session) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).run(id, input.description || '', projectId, clientId, input.task_id || null, input.work_type_id || null, now, input.billable !== false ? 1 : 0, JSON.stringify(input.tags || []), input.pomodoro ? 1 : 0, pomWork, pomBreak, 1);
 
     return this.getActiveTimer()!;
   }
@@ -203,18 +212,7 @@ export class AlibyeDB {
     const startTime = new Date(timer.start);
     const durationMs = now.getTime() - startTime.getTime();
 
-    // Resolve rate: project > client > default
-    let rate: number | null = null;
-    if (timer.project_id) {
-      const proj = this.getProject(timer.project_id);
-      if (proj?.rate) rate = proj.rate;
-    }
-    if (!rate && timer.client_id) {
-      const client = this.getClient(timer.client_id);
-      if (client?.rate) rate = client.rate;
-    }
-    if (!rate && this.config.default_rate > 0) rate = this.config.default_rate;
-
+    const rate = this.resolveRate({ task_id: timer.task_id, work_type_id: timer.work_type_id, project_id: timer.project_id, client_id: timer.client_id });
     const roundedMinutes = roundDuration(durationMs, this.config.rounding_mode, this.config.rounding_interval);
     const amount = timer.billable ? calcAmount(roundedMinutes, rate) : 0;
 
@@ -223,17 +221,15 @@ export class AlibyeDB {
 
     this.db.transaction(() => {
       this.db.prepare(
-        `INSERT INTO time_entries (id, description, project_id, client_id, start, end_, duration_ms, rounded_minutes, billable, rate, amount, source, is_break, is_idle, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-      ).run(entryId, timer.description, timer.project_id, timer.client_id, timer.start, nowStr, durationMs, roundedMinutes, timer.billable ? 1 : 0, rate, amount, timer.pomodoro ? 'pomodoro' : 'timer', 0, 0, nowStr, nowStr);
+        `INSERT INTO time_entries (id, description, project_id, client_id, task_id, work_type_id, start, end_, duration_ms, rounded_minutes, billable, rate, entry_rate_override, amount, source, is_break, is_idle, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      ).run(entryId, timer.description, timer.project_id, timer.client_id, timer.task_id, timer.work_type_id, timer.start, nowStr, durationMs, roundedMinutes, timer.billable ? 1 : 0, rate, null, amount, timer.pomodoro ? 'pomodoro' : 'timer', 0, 0, nowStr, nowStr);
 
-      // Assign tags
       const tags: string[] = timer.tags || [];
       for (const tagName of tags) {
         const tag = this.getOrCreateTag(tagName);
         this.db.prepare('INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?,?)').run(entryId, tag.id);
       }
 
-      // Clear timer
       this.db.prepare('DELETE FROM active_timer').run();
     })();
 
@@ -253,18 +249,28 @@ export class AlibyeDB {
 
   // ─── Time Entries ─────────────────────────────────────────
 
-  createEntry(input: { description?: string; project_id?: string; client_id?: string; start: string; end: string; billable?: boolean; is_break?: boolean; tags?: string[] }): TimeEntry {
+  createEntry(input: { description?: string; project_id?: string; client_id?: string; task_id?: string; work_type_id?: string; entry_rate_override?: number; start: string; end: string; billable?: boolean; is_break?: boolean; tags?: string[] }): TimeEntry {
     const startTime = new Date(input.start);
     const endTime = new Date(input.end);
     const durationMs = endTime.getTime() - startTime.getTime();
     if (durationMs < 0) throw new Error('End time must be after start time');
 
-    // Resolve rate
-    let rate: number | null = null;
-    if (input.project_id) { const p = this.getProject(input.project_id); if (p?.rate) rate = p.rate; }
-    if (!rate && input.client_id) { const c = this.getClient(input.client_id); if (c?.rate) rate = c.rate; }
-    if (!rate && this.config.default_rate > 0) rate = this.config.default_rate;
+    // Auto-resolve project/client from task
+    let projectId = input.project_id || null;
+    let clientId = input.client_id || null;
+    if (input.task_id) {
+      const task = this.getTask(input.task_id);
+      if (task) {
+        if (!projectId && task.project_id) projectId = task.project_id;
+        if (!clientId && task.client_id) clientId = task.client_id;
+      }
+    }
+    if (!clientId && projectId) {
+      const proj = this.getProject(projectId);
+      if (proj) clientId = proj.client_id;
+    }
 
+    const rate = this.resolveRate({ entry_rate_override: input.entry_rate_override, task_id: input.task_id, work_type_id: input.work_type_id, project_id: projectId, client_id: clientId });
     const roundedMinutes = roundDuration(durationMs, this.config.rounding_mode, this.config.rounding_interval);
     const billable = input.billable !== false && !input.is_break;
     const amount = billable ? calcAmount(roundedMinutes, rate) : 0;
@@ -274,8 +280,8 @@ export class AlibyeDB {
 
     this.db.transaction(() => {
       this.db.prepare(
-        `INSERT INTO time_entries (id, description, project_id, client_id, start, end_, duration_ms, rounded_minutes, billable, rate, amount, source, is_break, is_idle, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-      ).run(id, input.description || '', input.project_id || null, input.client_id || null, input.start, input.end, durationMs, roundedMinutes, billable ? 1 : 0, rate, amount, 'manual', input.is_break ? 1 : 0, 0, now, now);
+        `INSERT INTO time_entries (id, description, project_id, client_id, task_id, work_type_id, start, end_, duration_ms, rounded_minutes, billable, rate, entry_rate_override, amount, source, is_break, is_idle, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      ).run(id, input.description || '', projectId, clientId, input.task_id || null, input.work_type_id || null, input.start, input.end, durationMs, roundedMinutes, billable ? 1 : 0, rate, input.entry_rate_override ?? null, amount, 'manual', input.is_break ? 1 : 0, 0, now, now);
 
       for (const tagName of input.tags || []) {
         const tag = this.getOrCreateTag(tagName);
@@ -291,13 +297,15 @@ export class AlibyeDB {
     return row ? this.rowToEntry(row) : null;
   }
 
-  queryEntries(filters: { from?: string; to?: string; project_id?: string; client_id?: string; billable?: boolean; is_break?: boolean; limit?: number } = {}): TimeEntry[] {
+  queryEntries(filters: { from?: string; to?: string; project_id?: string; client_id?: string; task_id?: string; work_type_id?: string; billable?: boolean; is_break?: boolean; limit?: number } = {}): TimeEntry[] {
     let sql = 'SELECT * FROM time_entries WHERE 1=1';
     const params: any[] = [];
     if (filters.from) { sql += ' AND start >= ?'; params.push(filters.from); }
     if (filters.to) { sql += ' AND start <= ?'; params.push(filters.to); }
     if (filters.project_id) { sql += ' AND project_id = ?'; params.push(filters.project_id); }
     if (filters.client_id) { sql += ' AND client_id = ?'; params.push(filters.client_id); }
+    if (filters.task_id) { sql += ' AND task_id = ?'; params.push(filters.task_id); }
+    if (filters.work_type_id) { sql += ' AND work_type_id = ?'; params.push(filters.work_type_id); }
     if (filters.billable !== undefined) { sql += ' AND billable = ?'; params.push(filters.billable ? 1 : 0); }
     if (filters.is_break !== undefined) { sql += ' AND is_break = ?'; params.push(filters.is_break ? 1 : 0); }
     sql += ' ORDER BY start DESC';
@@ -305,17 +313,29 @@ export class AlibyeDB {
     return (this.db.prepare(sql).all(...params) as any[]).map(r => this.rowToEntry(r));
   }
 
-  updateEntry(id: string, updates: Partial<Pick<TimeEntry, 'description' | 'project_id' | 'client_id' | 'billable' | 'start' | 'end'>>): TimeEntry {
+  updateEntry(id: string, updates: Partial<Pick<TimeEntry, 'description' | 'project_id' | 'client_id' | 'task_id' | 'work_type_id' | 'entry_rate_override' | 'rate' | 'billable' | 'start' | 'end'>> & { tags?: string[] }): TimeEntry {
     const entry = this.getEntry(id);
     if (!entry) throw new EntryNotFoundError(id);
 
     const fields: string[] = [];
     const values: any[] = [];
+    const boolKeys = new Set(['billable']);
+
     for (const [key, val] of Object.entries(updates)) {
-      if (val !== undefined) {
+      if (val !== undefined && key !== 'tags') {
         const col = key === 'end' ? 'end_' : key;
         fields.push(`${col} = ?`);
-        values.push(key === 'billable' ? (val ? 1 : 0) : val);
+        values.push(boolKeys.has(key) ? (val ? 1 : 0) : val);
+      }
+    }
+
+    // Handle tags
+    if (updates.tags !== undefined) {
+      // Remove old tags, add new ones
+      this.db.prepare('DELETE FROM entry_tags WHERE entry_id = ?').run(id);
+      for (const tagName of updates.tags) {
+        const tag = this.getOrCreateTag(tagName);
+        this.db.prepare('INSERT OR IGNORE INTO entry_tags (entry_id, tag_id) VALUES (?,?)').run(id, tag.id);
       }
     }
 
@@ -328,6 +348,20 @@ export class AlibyeDB {
         const roundedMinutes = roundDuration(durationMs, this.config.rounding_mode, this.config.rounding_interval);
         fields.push('duration_ms = ?', 'rounded_minutes = ?');
         values.push(durationMs, roundedMinutes);
+      }
+
+      // Re-resolve rate if relevant fields changed and no explicit rate set
+      if ((updates.project_id !== undefined || updates.client_id !== undefined || updates.task_id !== undefined || updates.work_type_id !== undefined || updates.entry_rate_override !== undefined) && updates.rate === undefined) {
+        const newEntry = { ...entry, ...updates };
+        const resolvedRate = this.resolveRate({ entry_rate_override: newEntry.entry_rate_override, task_id: newEntry.task_id, work_type_id: newEntry.work_type_id, project_id: newEntry.project_id, client_id: newEntry.client_id });
+        fields.push('rate = ?');
+        values.push(resolvedRate);
+        // Recalculate amount
+        const isBillable = updates.billable !== undefined ? updates.billable : entry.billable;
+        const rm = updates.start || updates.end ? roundDuration(new Date((updates.end || entry.end)!).getTime() - new Date(updates.start || entry.start).getTime(), this.config.rounding_mode, this.config.rounding_interval) : entry.rounded_minutes;
+        const amt = isBillable ? calcAmount(rm, resolvedRate) : 0;
+        fields.push('amount = ?');
+        values.push(amt);
       }
 
       fields.push("updated_at = ?");
@@ -410,6 +444,125 @@ export class AlibyeDB {
     const c = this.getClient(idOrName);
     if (!c) throw new ClientNotFoundError(idOrName);
     this.db.prepare('UPDATE clients SET archived = 1 WHERE id = ?').run(c.id);
+  }
+
+  // ─── Tasks ──────────────────────────────────────────────────
+
+  createTask(input: { name: string; project_id?: string; client_id?: string; rate?: number; budget_hours?: number; budget_amount?: number; billable?: boolean }): Task {
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    // Resolve client from project if not specified
+    let clientId = input.client_id || null;
+    if (!clientId && input.project_id) {
+      const proj = this.getProject(input.project_id);
+      if (proj) clientId = proj.client_id;
+    }
+    this.db.prepare(
+      'INSERT INTO tasks (id, name, project_id, client_id, rate, budget_hours, budget_amount, billable, created_at) VALUES (?,?,?,?,?,?,?,?,?)'
+    ).run(id, input.name, input.project_id || null, clientId, input.rate ?? null, input.budget_hours ?? null, input.budget_amount ?? null, input.billable !== false ? 1 : 0, now);
+    return this.getTask(id)!;
+  }
+
+  getTask(idOrName: string): Task | null {
+    const row = this.db.prepare('SELECT * FROM tasks WHERE id = ? OR name = ?').get(idOrName, idOrName) as any;
+    return row ? this.rowToTask(row) : null;
+  }
+
+  private rowToTask(row: any): Task {
+    return { id: row.id, name: row.name, project_id: row.project_id, client_id: row.client_id, rate: row.rate, budget_hours: row.budget_hours ?? null, budget_amount: row.budget_amount ?? null, billable: !!row.billable, archived: !!row.archived, created_at: row.created_at };
+  }
+
+  listTasks(filters?: { project_id?: string; client_id?: string; includeArchived?: boolean }): Task[] {
+    let sql = 'SELECT * FROM tasks';
+    const params: any[] = [];
+    const conditions: string[] = [];
+    if (!filters?.includeArchived) conditions.push('archived = 0');
+    if (filters?.project_id) { conditions.push('project_id = ?'); params.push(filters.project_id); }
+    if (filters?.client_id) { conditions.push('client_id = ?'); params.push(filters.client_id); }
+    if (conditions.length) sql += ' WHERE ' + conditions.join(' AND ');
+    sql += ' ORDER BY name';
+    return (this.db.prepare(sql).all(...params) as any[]).map(r => this.rowToTask(r));
+  }
+
+  updateTask(id: string, updates: Partial<Pick<Task, 'name' | 'project_id' | 'client_id' | 'rate' | 'budget_hours' | 'budget_amount' | 'billable'>>): Task {
+    const task = this.getTask(id);
+    if (!task) throw new TaskNotFoundError(id);
+    const fields: string[] = [];
+    const values: any[] = [];
+    for (const [key, val] of Object.entries(updates)) {
+      if (val !== undefined) {
+        fields.push(`${key} = ?`);
+        values.push(key === 'billable' ? (val ? 1 : 0) : val);
+      }
+    }
+    if (fields.length > 0) {
+      values.push(id);
+      this.db.prepare(`UPDATE tasks SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+    }
+    return this.getTask(id)!;
+  }
+
+  archiveTask(idOrName: string): void {
+    const t = this.getTask(idOrName);
+    if (!t) throw new TaskNotFoundError(idOrName);
+    this.db.prepare('UPDATE tasks SET archived = 1 WHERE id = ?').run(t.id);
+  }
+
+  // ─── Work Types ────────────────────────────────────────────
+
+  createWorkType(input: { name: string; rate?: number }): WorkType {
+    const id = randomUUID();
+    const now = new Date().toISOString();
+    this.db.prepare('INSERT INTO work_types (id, name, rate, created_at) VALUES (?,?,?,?)').run(id, input.name, input.rate ?? null, now);
+    return this.getWorkType(id)!;
+  }
+
+  getWorkType(idOrName: string): WorkType | null {
+    const row = this.db.prepare('SELECT * FROM work_types WHERE id = ? OR name = ?').get(idOrName, idOrName) as any;
+    return row ? { id: row.id, name: row.name, rate: row.rate, created_at: row.created_at } : null;
+  }
+
+  listWorkTypes(): WorkType[] {
+    return (this.db.prepare('SELECT * FROM work_types ORDER BY name').all() as any[]).map(r => ({ id: r.id, name: r.name, rate: r.rate, created_at: r.created_at }));
+  }
+
+  updateWorkType(id: string, updates: Partial<Pick<WorkType, 'name' | 'rate'>>): WorkType {
+    const wt = this.getWorkType(id);
+    if (!wt) throw new WorkTypeNotFoundError(id);
+    const fields: string[] = [];
+    const values: any[] = [];
+    for (const [key, val] of Object.entries(updates)) {
+      if (val !== undefined) { fields.push(`${key} = ?`); values.push(val); }
+    }
+    if (fields.length > 0) {
+      values.push(id);
+      this.db.prepare(`UPDATE work_types SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+    }
+    return this.getWorkType(id)!;
+  }
+
+  deleteWorkType(idOrName: string): void {
+    const wt = this.getWorkType(idOrName);
+    if (!wt) throw new WorkTypeNotFoundError(idOrName);
+    this.db.prepare('DELETE FROM work_types WHERE id = ?').run(wt.id);
+  }
+
+  // ─── Rate Cascade ──────────────────────────────────────────
+
+  private resolveRate(opts: { entry_rate_override?: number | null; task_id?: string | null; work_type_id?: string | null; project_id?: string | null; client_id?: string | null }): number | null {
+    // 1. Explicit override
+    if (opts.entry_rate_override && opts.entry_rate_override > 0) return opts.entry_rate_override;
+    // 2. Task rate
+    if (opts.task_id) { const t = this.getTask(opts.task_id); if (t?.rate && t.rate > 0) return t.rate; }
+    // 3. Work type rate
+    if (opts.work_type_id) { const wt = this.getWorkType(opts.work_type_id); if (wt?.rate && wt.rate > 0) return wt.rate; }
+    // 4. Project rate
+    if (opts.project_id) { const p = this.getProject(opts.project_id); if (p?.rate && p.rate > 0) return p.rate; }
+    // 5. Client rate
+    if (opts.client_id) { const c = this.getClient(opts.client_id); if (c?.rate && c.rate > 0) return c.rate; }
+    // 6. Default rate
+    if (this.config.default_rate > 0) return this.config.default_rate;
+    return null;
   }
 
   // ─── Tags ─────────────────────────────────────────────────
@@ -528,6 +681,8 @@ export class AlibyeDB {
       total_entries: count('SELECT COUNT(*) as c FROM time_entries'),
       projects: count('SELECT COUNT(*) as c FROM projects WHERE archived = 0'),
       clients: count('SELECT COUNT(*) as c FROM clients WHERE archived = 0'),
+      tasks: count('SELECT COUNT(*) as c FROM tasks WHERE archived = 0'),
+      work_types: count('SELECT COUNT(*) as c FROM work_types'),
       tags: count('SELECT COUNT(*) as c FROM tags'),
       timer_running: !!this.getActiveTimer(),
     };
@@ -553,12 +708,14 @@ export class AlibyeDB {
 
   exportCSV(from: string, to: string): string {
     const entries = this.queryEntries({ from, to });
-    const header = 'Date,Start,End,Description,Project,Client,Duration (min),Rounded (min),Billable,Rate,Amount,Tags';
+    const header = 'Date,Start,End,Description,Project,Client,Task,WorkType,Duration (min),Rounded (min),Billable,Rate,Amount,Tags';
     const rows = entries.map(e => {
       const proj = e.project_id ? this.getProject(e.project_id)?.name || '' : '';
       const client = e.client_id ? this.getClient(e.client_id)?.name || '' : '';
+      const task = e.task_id ? this.getTask(e.task_id)?.name || '' : '';
+      const workType = e.work_type_id ? this.getWorkType(e.work_type_id)?.name || '' : '';
       const tags = this.getEntryTags(e.id).map(t => t.name).join(';');
-      return `${e.start.split('T')[0]},${e.start},${e.end || ''},${csvEscape(e.description)},${csvEscape(proj)},${csvEscape(client)},${(e.duration_ms / 60000).toFixed(2)},${e.rounded_minutes},${e.billable},${e.rate || 0},${e.amount},${csvEscape(tags)}`;
+      return `${e.start.split('T')[0]},${e.start},${e.end || ''},${csvEscape(e.description)},${csvEscape(proj)},${csvEscape(client)},${csvEscape(task)},${csvEscape(workType)},${(e.duration_ms / 60000).toFixed(2)},${e.rounded_minutes},${e.billable},${e.rate || 0},${e.amount},${csvEscape(tags)}`;
     });
     return [header, ...rows].join('\n');
   }

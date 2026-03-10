@@ -453,7 +453,7 @@ describe('Report Edge Cases', () => {
 describe('CSV Export Edge Cases', () => {
   it('empty export has only header', () => {
     const csv = a.exportCSV(isoAgo(1440), isoNow());
-    expect(csv).toBe('Date,Start,End,Description,Project,Client,Duration (min),Rounded (min),Billable,Rate,Amount,Tags');
+    expect(csv).toBe('Date,Start,End,Description,Project,Client,Task,WorkType,Duration (min),Rounded (min),Billable,Rate,Amount,Tags');
   });
 
   it('escapes commas in description', () => {

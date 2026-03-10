@@ -32,6 +32,20 @@ export class Alibye {
   deleteEntry(id: string) { return this._db.deleteEntry(id); }
   entryTags(entryId: string) { return this._db.getEntryTags(entryId); }
 
+  // Tasks
+  createTask(input: Parameters<AlibyeDB['createTask']>[0]) { return this._db.createTask(input); }
+  task(idOrName: string) { return this._db.getTask(idOrName); }
+  tasks(filters?: Parameters<AlibyeDB['listTasks']>[0]) { return this._db.listTasks(filters); }
+  updateTask(id: string, updates: Parameters<AlibyeDB['updateTask']>[1]) { return this._db.updateTask(id, updates); }
+  archiveTask(idOrName: string) { return this._db.archiveTask(idOrName); }
+
+  // Work Types
+  createWorkType(input: Parameters<AlibyeDB['createWorkType']>[0]) { return this._db.createWorkType(input); }
+  workType(idOrName: string) { return this._db.getWorkType(idOrName); }
+  workTypes() { return this._db.listWorkTypes(); }
+  updateWorkType(id: string, updates: Parameters<AlibyeDB['updateWorkType']>[1]) { return this._db.updateWorkType(id, updates); }
+  deleteWorkType(idOrName: string) { return this._db.deleteWorkType(idOrName); }
+
   // Projects
   createProject(input: Parameters<AlibyeDB['createProject']>[0]) { return this._db.createProject(input); }
   project(idOrName: string) { return this._db.getProject(idOrName); }
@@ -73,6 +87,8 @@ export class Alibye {
       description: entry.description,
       project_id: entry.project_id || undefined,
       client_id: entry.client_id || undefined,
+      task_id: entry.task_id || undefined,
+      work_type_id: entry.work_type_id || undefined,
       billable: entry.billable,
       tags,
     });
